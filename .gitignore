@@ -1,0 +1,8 @@
+# Secrets: never commit these
+.streamlit/secrets.toml
+.env
+secrets.env
+
+# Local caches
+prism_cache/
+__pycache__/
