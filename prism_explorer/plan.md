@@ -7,3 +7,7 @@ This python script should fulfill the folowing goals:
 
 Requirements
 - Requests (latest, update with version number) 
+
+Todo: 
+FIX VENV
+Remove dependencies, move to Activate.ps1
