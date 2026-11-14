@@ -5,4 +5,7 @@
 
 Good Data Sources So Far:
 - Imerg: rainfall reliability and percipitation
-- Accessible via [API](insert URL here)
+- Accessible via [API](insert url here)
+- CDL: Crop and crop rotation
+- Accessible via [API](https://nassgeodata.gmu.edu/CropScape/)
+
