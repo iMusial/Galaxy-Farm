@@ -9,7 +9,7 @@ Install:   pip install streamlit streamlit-folium folium requests numpy pandas p
 Run:       streamlit run prism_explorer.py
 
 Data: PRISM Climate Group, Oregon State University (https://prism.oregonstate.edu)
-Web service: https://services.nacse.org/prism/data/public/...   (continental US only)
+Web service: https://services.nacse.org/prism/data/get/us/4km/...   (continental US only)
 Downloaded zips are cached in ./prism_cache so each file is only fetched once.
 """
 import datetime as dt
@@ -29,30 +29,34 @@ import streamlit as st
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
-BASE = "https://services.nacse.org/prism/data/public"
+BASE = "https://services.nacse.org/prism/data/get/us/4km"
+ERRORS = {}  # url -> last failure reason (shown in the UI if nothing downloads)
 CACHE = Path("prism_cache")
 CACHE.mkdir(exist_ok=True)
 LABEL = {"ppt": "Precipitation", "tmin": "Min temp", "tmax": "Max temp", "tmean": "Mean temp"}
 COLOR = {"ppt": "#2b7bba", "tmin": "#4a90d9", "tmax": "#d9534f", "tmean": "#e6a23c"}
+MAX_FILES = 1500  # safety cap on downloads per request
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
 # ----------------------------------------------------------------- PRISM access
 def fetch_zip(url):
-    """Download a PRISM zip (with on-disk cache). Returns bytes or None if unavailable."""
+    """Download a PRISM zip (with on-disk cache). Returns bytes, or None (reason stored in ERRORS)."""
     fp = CACHE / (re.sub(r"[^A-Za-z0-9]+", "_", url.replace(BASE, "")) + ".zip")
     if fp.exists():
         return fp.read_bytes()
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=90)
-        except requests.RequestException:
+        except requests.RequestException as e:
+            ERRORS[url] = f"Network error: {e}"
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code == 200 and r.content[:2] == b"PK":
             fp.write_bytes(r.content)
             return r.content
-        if r.status_code in (400, 404):
+        ERRORS[url] = f"HTTP {r.status_code}: {r.text[:200]!r}"
+        if r.status_code < 500:  # 4xx (not published / download limit) - retrying won't help
             return None
         time.sleep(2 * (attempt + 1))
     return None
@@ -63,13 +67,17 @@ def read_bil(zip_bytes):
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         names = z.namelist()
         bil = next(n for n in names if n.lower().endswith(".bil"))
-        hdr = next(n for n in names if n.lower().endswith(".hdr"))
-        h = dict(l.split(None, 1) for l in z.read(hdr).decode().splitlines() if len(l.split()) > 1)
-        h = {k.upper(): v.strip() for k, v in h.items()}
+        hdr = next((n for n in names if n.lower().endswith(".hdr")), None)
+        h = {}
+        if hdr:
+            h = dict(l.split(None, 1) for l in z.read(hdr).decode().splitlines() if len(l.split()) > 1)
+            h = {k.upper(): v.strip() for k, v in h.items()}
         dtype = "<f4" if h.get("BYTEORDER", "I") == "I" else ">f4"
-        arr = np.frombuffer(z.read(bil), dtype=dtype).reshape(int(h["NROWS"]), int(h["NCOLS"])).astype(float)
+        # defaults = standard 4 km CONUS grid, used only if the header lacks a value
+        arr = np.frombuffer(z.read(bil), dtype=dtype).reshape(int(h.get("NROWS", 621)), int(h.get("NCOLS", 1405))).astype(float)
     arr[arr <= float(h.get("NODATA", -9999)) + 1] = np.nan
-    meta = dict(ulx=float(h["ULXMAP"]), uly=float(h["ULYMAP"]), xdim=float(h["XDIM"]), ydim=float(h["YDIM"]))
+    meta = dict(ulx=float(h.get("ULXMAP", -125.0208333333333)), uly=float(h.get("ULYMAP", 49.9375)),
+                xdim=float(h.get("XDIM", 0.0416666666666667)), ydim=float(h.get("YDIM", 0.0416666666666667)))
     return arr, meta
 
 
@@ -124,30 +132,45 @@ def area_value(zip_bytes, geom):
     return (float(vals.mean()) if len(vals) else np.nan), len(vals)
 
 
-def run_fetch(geom, elements, y0, y1, use_normals):
-    month0 = dt.date.today().replace(day=1)
+def month_span(d0, d1):
+    y, m = d0.year, d0.month
+    while (y, m) <= (d1.year, d1.month):
+        yield y, m
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+
+def build_tasks(elements, mode, d0, d1):
+    """List of (kind, element, year, month, day, url) downloads for the chosen date range."""
+    today = dt.date.today()
     tasks = []
     for el in elements:
-        for y in range(y0, y1 + 1):
-            for m in range(1, 13):
-                if dt.date(y, m, 1) < month0:
-                    tasks.append(("monthly", el, y, m, f"{BASE}/4km/{el}/{y}{m:02d}"))
-        if use_normals:
-            for m in range(1, 13):
-                tasks.append(("normal", el, 0, m, f"{BASE}/normals/4km/{el}/{m:02d}"))
+        if mode == "Daily":
+            for k in range((d1 - d0).days + 1):
+                d = d0 + dt.timedelta(days=k)
+                if d < today:
+                    tasks.append(("daily", el, d.year, d.month, d.day, f"{BASE}/{el}/{d:%Y%m%d}?format=bil"))
+        else:
+            for y, m in month_span(d0, d1):
+                if dt.date(y, m, 1) < today.replace(day=1):
+                    tasks.append(("monthly", el, y, m, 1, f"{BASE}/{el}/{y}{m:02d}?format=bil"))
+    return tasks
+
+
+def run_fetch(geom, tasks):
+    ERRORS.clear()
     rows, missing, ncells = [], 0, 0
     bar = st.progress(0.0, "Downloading PRISM grids…")
-    with ThreadPoolExecutor(4) as ex:
-        futs = {ex.submit(fetch_zip, t[4]): t for t in tasks}
+    with ThreadPoolExecutor(2) as ex:
+        futs = {ex.submit(fetch_zip, t[5]): t for t in tasks}
         for i, fut in enumerate(as_completed(futs), 1):
-            kind, el, y, m, _ = futs[fut]
+            kind, el, y, m, dd, _ = futs[fut]
             data = fut.result()
             if data is None:
                 missing += 1
             else:
                 v, n = area_value(data, geom)
                 ncells = max(ncells, n)
-                rows.append(dict(kind=kind, element=el, year=y, month=m, value=v))
+                rows.append(dict(kind=kind, element=el, year=y, month=m, day=dd, value=v))
             bar.progress(i / len(tasks), f"Processed {i}/{len(tasks)} grids")
     bar.empty()
     return pd.DataFrame(rows), missing, ncells
@@ -193,6 +216,37 @@ def convert(df, units):
     return df
 
 
+def daily_summary(ts, elements, p_unit, t_unit):
+    items = []
+    if "ppt" in elements:
+        s = ts[ts.element == "ppt"].dropna(subset=["value"]).set_index("date").value
+        if len(s):
+            wet = 0.254 if p_unit == "mm" else 0.01
+            items += [
+                ("Total precipitation", f"{s.sum():.1f} {p_unit}"),
+                ("Wettest day", f"{s.max():.1f} {p_unit} on {s.idxmax():%b %d}"),
+                ("Days with measurable rain", f"{int((s >= wet).sum())} of {len(s)}"),
+            ]
+    for e, lab, fn in [("tmax", "Hottest daily max", "max"), ("tmin", "Coldest daily min", "min"), ("tmean", "Average mean temp", "mean")]:
+        if e in elements:
+            s = ts[ts.element == e].dropna(subset=["value"]).set_index("date").value
+            if len(s):
+                v = getattr(s, fn)()
+                extra = f" on {(s.idxmax() if fn == 'max' else s.idxmin()):%b %d}" if fn != "mean" else ""
+                items.append((lab, f"{v:.1f} {t_unit}{extra}"))
+    if not items:
+        st.info("No data in this range.")
+        return
+    cols = st.columns(min(len(items), 3))
+    for k, (lab, val) in enumerate(items):
+        cols[k % len(cols)].metric(lab, val)
+    if "ppt" in elements:
+        s = ts[ts.element == "ppt"].sort_values("date")
+        f = go.Figure(go.Scatter(x=s.date, y=s.value.fillna(0).cumsum(), fill="tozeroy", line_color=COLOR["ppt"]))
+        f.update_layout(title="Cumulative precipitation", yaxis_title=p_unit, height=320)
+        st.plotly_chart(f, use_container_width=True)
+
+
 # ------------------------------------------------------------------------- UI
 st.set_page_config(page_title="PRISM Climate Explorer", layout="wide")
 st.title("🌎 PRISM Climate Explorer")
@@ -226,12 +280,26 @@ with st.sidebar:
 
     st.header("2 · Data options")
     elements = st.multiselect("Variables", list(LABEL), default=["ppt", "tmin", "tmax"], format_func=LABEL.get)
-    this_year = dt.date.today().year
-    y0, y1 = st.slider("Years", 1981, this_year, (this_year - 5, this_year - 1))
-    use_normals = st.checkbox("Compare with 1991–2020 normals", value=True)
+    mode = st.radio("Time step", ["Monthly", "Daily"], horizontal=True)
+    today = dt.date.today()
+    if mode == "Daily":
+        default = (today - dt.timedelta(days=37), today - dt.timedelta(days=7))
+    else:
+        default = (dt.date(today.year - 5, 1, 1), dt.date(today.year - 1, 12, 31))
+    rng = st.date_input("Date range (start → end)", value=default, min_value=dt.date(1981, 1, 1),
+                        max_value=today, key=f"range_{mode}")
+    valid = isinstance(rng, (tuple, list)) and len(rng) == 2
+    d0, d1 = rng if valid else (None, None)
+    if not valid:
+        st.info("Pick an end date to complete the range.")
     units = st.radio("Units", ["Metric (mm, °C)", "US (in, °F)"])
-    n_files = len(elements) * ((y1 - y0 + 1) * 12 + (12 if use_normals else 0))
-    st.caption(f"≈ {n_files} small downloads (cached after the first run).")
+    tasks = build_tasks(elements, mode, d0, d1) if valid else []
+    too_many = len(tasks) > MAX_FILES
+    st.caption(f"≈ {len(tasks)} small downloads (cached after the first run).")
+    if too_many:
+        st.error(f"Too many files (max {MAX_FILES}). Shorten the range or pick fewer variables.")
+    if mode == "Daily":
+        st.caption("Recent daily grids are provisional, and the newest days may not be published yet.")
 
 # Map
 m = folium.Map(location=ss.center, zoom_start=ss.zoom, tiles=None)
@@ -258,13 +326,16 @@ else:
         st.success(f"Selection: polygon, ≈ {approx_area_km2(geom[1]):.2f} km²")
     else:
         st.success(f"Selection: point at {geom[1][1]:.4f}, {geom[1][0]:.4f} (nearest 4 km PRISM cell)")
-    if st.button("📊 Fetch PRISM data", type="primary", disabled=not elements):
-        df, missing, ncells = run_fetch(geom, elements, y0, y1, use_normals)
+    if st.button("📊 Fetch PRISM data", type="primary", disabled=not elements or not tasks or too_many):
+        df, missing, ncells = run_fetch(geom, tasks)
         if df.empty or df.value.isna().all():
-            st.error("No data returned. PRISM covers the continental US only — is your selection inside it?")
+            st.error("No data returned. PRISM covers the continental US only, so check your selection is inside it.")
+            if ERRORS:
+                st.caption("First download problem reported:")
+                st.code(next(iter(ERRORS.items())))
             ss.data = None
         else:
-            ss.data = dict(df=df, missing=missing, ncells=ncells)
+            ss.data = dict(df=df, missing=missing, ncells=ncells, mode=mode, d0=d0, d1=d1)
 
 # Graphs
 if ss.data:
@@ -272,52 +343,53 @@ if ss.data:
     st.markdown(f"**Grid cells averaged:** {d['ncells']}" + (f"  ·  ⚠️ {d['missing']} grids unavailable (likely not yet published)" if d["missing"] else ""))
     df = convert(d["df"], units)
     p_unit, t_unit = ("mm", "°C") if units.startswith("Metric") else ("in", "°F")
-    ts = df[df.kind == "monthly"].copy()
-    ts["date"] = pd.to_datetime(dict(year=ts.year, month=ts.month, day=1))
+    y0, y1 = d["d0"].year, d["d1"].year
+    daily = d["mode"] == "Daily"
+    step = "Daily" if daily else "Monthly"
+    ts = df[df.kind != "normal"].copy()
+    ts["date"] = pd.to_datetime(dict(year=ts.year, month=ts.month, day=ts.day))
     ts = ts.sort_values("date")
-    nrm = df[df.kind == "normal"]
     temps = [e for e in elements if e != "ppt"]
 
-    t1, t2, t3, t4 = st.tabs(["Monthly time series", "vs. 30-year normal", "Annual summary", "Data"])
+    t1, t2, t3, t4 = st.tabs([f"{step} time series", "Summary" if daily else "By calendar month", "Annual summary", "Data"])
 
     with t1:
         if "ppt" in elements:
             s = ts[ts.element == "ppt"]
             f = go.Figure(go.Bar(x=s.date, y=s.value, marker_color=COLOR["ppt"], name="Precipitation"))
-            f.update_layout(title="Monthly precipitation", yaxis_title=p_unit, height=350)
+            f.update_layout(title=f"{step} precipitation", yaxis_title=p_unit, height=350)
             st.plotly_chart(f, use_container_width=True)
         if temps:
             f = go.Figure()
             for e in temps:
                 s = ts[ts.element == e]
                 f.add_scatter(x=s.date, y=s.value, mode="lines+markers", name=LABEL[e], line_color=COLOR[e])
-            f.update_layout(title="Monthly temperature", yaxis_title=t_unit, height=350)
+            f.update_layout(title=f"{step} temperature", yaxis_title=t_unit, height=350)
             st.plotly_chart(f, use_container_width=True)
 
     with t2:
-        if nrm.empty:
-            st.info("Enable “Compare with 1991–2020 normals” and fetch again.")
+        if daily:
+            daily_summary(ts, elements, p_unit, t_unit)
         else:
             avg = ts.groupby(["element", "month"]).value.mean().reset_index()
             if "ppt" in elements:
-                a, n = avg[avg.element == "ppt"], nrm[nrm.element == "ppt"].sort_values("month")
-                f = go.Figure()
-                f.add_bar(x=MONTHS, y=a.value, name=f"{y0}–{y1} average", marker_color=COLOR["ppt"])
-                f.add_bar(x=MONTHS, y=n.value, name="1991–2020 normal", marker_color="#b0b7c3")
-                f.update_layout(title="Precipitation by calendar month", barmode="group", yaxis_title=p_unit, height=350)
+                a = avg[avg.element == "ppt"]
+                f = go.Figure(go.Bar(x=[MONTHS[m - 1] for m in a.month], y=a.value, marker_color=COLOR["ppt"]))
+                f.update_layout(title=f"Average monthly precipitation ({d['d0']:%b %Y} – {d['d1']:%b %Y})", yaxis_title=p_unit, height=350)
                 st.plotly_chart(f, use_container_width=True)
             if temps:
                 f = go.Figure()
                 for e in temps:
-                    a, n = avg[avg.element == e], nrm[nrm.element == e].sort_values("month")
-                    f.add_scatter(x=MONTHS, y=a.value, name=f"{LABEL[e]} ({y0}–{y1})", line_color=COLOR[e])
-                    f.add_scatter(x=MONTHS, y=n.value, name=f"{LABEL[e]} normal", line=dict(color=COLOR[e], dash="dash"))
-                f.update_layout(title="Temperature by calendar month", yaxis_title=t_unit, height=380)
+                    a = avg[avg.element == e]
+                    f.add_scatter(x=[MONTHS[m - 1] for m in a.month], y=a.value, mode="lines+markers", name=LABEL[e], line_color=COLOR[e])
+                f.update_layout(title="Average temperature by calendar month", yaxis_title=t_unit, height=350)
                 st.plotly_chart(f, use_container_width=True)
 
     with t3:
         full = ts.groupby(["element", "year"]).filter(lambda g: len(g) == 12)
-        if full.empty:
+        if daily:
+            st.info("Annual summary is available in Monthly mode.")
+        elif full.empty:
             st.info("No complete calendar years in the selected range.")
         else:
             if "ppt" in elements:
@@ -334,6 +406,6 @@ if ss.data:
                 st.plotly_chart(f, use_container_width=True)
 
     with t4:
-        wide = df.pivot_table(index=["kind", "year", "month"], columns="element", values="value").reset_index()
+        wide = df.pivot_table(index=["kind", "year", "month", "day"], columns="element", values="value").reset_index()
         st.dataframe(wide, use_container_width=True)
         st.download_button("Download CSV", wide.to_csv(index=False), "prism_selection.csv", "text/csv")
