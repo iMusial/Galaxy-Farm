@@ -2,15 +2,15 @@
 Simple List:
 1. Tell farmers when to plant
 2. Use data trends to make predictions
-3. Use serp API in combination with data to build a crop rotation strategy
+3. Use serpAPI in combination with data to build a crop rotation strategy
 4. Recommend a crop rotation strategy
 
 ## 1. Establish a List of Usable data
 - Determine seasonal trends from data?
-- Data should be accessable via APIs so we aren't downloading large files
+- Data should be accessible via APIs so we aren't downloading large files
 
 Good Data Sources So Far:
-- Imerg: rainfall reliability and percipitation
+- Imerg: rainfall reliability and precipitation
 - Accessible via [API](insert url here)
 - CDL: Crop and crop rotation
 - Accessible via [API](https://nassgeodata.gmu.edu/CropScape/)
