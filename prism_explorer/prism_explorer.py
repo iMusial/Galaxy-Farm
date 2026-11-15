@@ -18,6 +18,7 @@ import base64
 import io
 import json
 import re
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,7 +40,7 @@ from streamlit_folium import st_folium
 
 BASE = "https://services.nacse.org/prism/data/get/us/4km"
 ERRORS = {}  # url -> last failure reason
-CACHE = Path("prism_cache")
+CACHE = Path(__file__).resolve().parent / "prism_cache"  # same cache no matter where the app is started from
 CACHE.mkdir(exist_ok=True)
 LABEL = {
     "ppt": "Precipitation",
@@ -60,23 +61,40 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", 
 
 
 # ----------------------------------------------------------------- PRISM access
+_local = threading.local()
+
+
+def _session():
+    # One keep-alive connection per download thread instead of a new TLS handshake per file.
+    if not hasattr(_local, "s"):
+        _local.s = requests.Session()
+    return _local.s
+
+
 def fetch_zip(url):
     fp = CACHE / (re.sub(r"[^A-Za-z0-9]+", "_", url.replace(BASE, "")) + ".zip")
     if fp.exists():
         return fp.read_bytes()
     for attempt in range(3):
         try:
-            r = requests.get(url, timeout=90)
+            r = _session().get(url, timeout=90)
         except requests.RequestException as e:
             ERRORS[url] = f"Network error: {e}"
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code == 200 and r.content[:2] == b"PK":
-            fp.write_bytes(r.content)
+            tmp = fp.with_suffix(".part")
+            tmp.write_bytes(r.content)
+            tmp.replace(fp)  # never leave a half-written zip in the cache
             return r.content
-        ERRORS[url] = f"HTTP {r.status_code}: {r.text[:200]!r}"
-        if r.status_code < 500:
+        text = r.text[:300]
+        if "more than twice" in text:
+            # PRISM allows each file twice per day; retrying risks an IP block.
+            ERRORS[url] = "LIMIT: " + text
             return None
+        ERRORS[url] = f"HTTP {r.status_code}: {text!r}"
+        if r.status_code != 429 and r.status_code < 500:
+            return None  # not available (e.g. not yet released); retrying won't help
         time.sleep(2 * (attempt + 1))
     return None
 
@@ -195,21 +213,43 @@ def compute_gdd_rows(df, base_c, daily):
 
 def run_fetch(geom, tasks):
     ERRORS.clear()
-    rows, missing, ncells = [], 0, 0
+    rows, failed, ncells = [], [], 0
     bar = st.progress(0.0, "Downloading PRISM grids…")
-    with ThreadPoolExecutor(2) as ex:
-        futs = {ex.submit(fetch_zip, t[5]): t for t in tasks}
-        for i, fut in enumerate(as_completed(futs), 1):
-            kind, el, y, m, dd, _ = futs[fut]
-            data = fut.result()
-            if data is None:
-                missing += 1
-            else:
-                v, n = area_value(data, geom)
-                ncells = max(ncells, n)
-                rows.append(dict(kind=kind, element=el, year=y, month=m, day=dd, value=v))
+
+    def handle(t, data):
+        nonlocal ncells
+        if data is None:
+            return False
+        v, n = area_value(data, geom)
+        ncells = max(ncells, n)
+        rows.append(dict(kind=t[0], element=t[1], year=t[2], month=t[3], day=t[4], value=v))
+        return True
+
+    # Grids already on disk need no network: read them first, then download only what's new.
+    to_get = []
+    for t in tasks:
+        fp = CACHE / (re.sub(r"[^A-Za-z0-9]+", "_", t[5].replace(BASE, "")) + ".zip")
+        if not (fp.exists() and handle(t, fp.read_bytes())):
+            to_get.append(t)
+    if to_get:
+        with ThreadPoolExecutor(4) as ex:
+            futs = {ex.submit(fetch_zip, t[5]): t for t in to_get}
+            for i, fut in enumerate(as_completed(futs), 1):
+                if not handle(futs[fut], fut.result()):
+                    failed.append(futs[fut])
+                bar.progress(i / len(to_get), f"Downloading PRISM grids… {i}/{len(to_get)} "
+                                              f"({len(tasks) - len(to_get)} already saved)")
+    # Second pass, one at a time, for network hiccups only. Files that hit PRISM's twice-a-day
+    # limit are not retried: asking again doesn't work and can get the IP blocked.
+    still_missing = [t for t in failed if ERRORS.get(t[5], "").startswith("LIMIT")]
+    retry = [t for t in failed if t not in still_missing]
+    for i, t in enumerate(retry, 1):
+        bar.progress(i / len(retry), f"Retrying {len(retry)} grids that failed…")
+        time.sleep(1)
+        if not handle(t, fetch_zip(t[5])):
+            still_missing.append(t)
     bar.empty()
-    return pd.DataFrame(rows), missing, ncells
+    return pd.DataFrame(rows), len(still_missing), ncells
 
 
 # ----------------------------------------------------------------- USDA SSURGO / SDA
@@ -957,6 +997,11 @@ else:
         st.success(f"Selection: point at {geom[1][1]:.4f}, {geom[1][0]:.4f}")
     if st.button("📊 Fetch data & soil properties", type="primary", disabled=not elements or not tasks or too_many):
         df, missing, ncells = run_fetch(geom, tasks)
+        n_limit = sum(v.startswith("LIMIT") for v in ERRORS.values())
+        if n_limit:
+            st.warning(f"{n_limit} PRISM grids were skipped because PRISM only lets each file be downloaded twice "
+                       "a day. They will download normally tomorrow (Pacific time), and the app saves every "
+                       "grid it gets, so this won't recur for the same months.")
         if df.empty or df.value.isna().all():
             st.error("No data returned. PRISM covers the continental US only.")
             ss.data = None
@@ -1041,11 +1086,15 @@ if ss.data:
                 st.plotly_chart(f, use_container_width=True)
 
     with t3:
-        full = ts.groupby(["element", "year"]).filter(lambda g: len(g) == 12)
+        months_have = ts.dropna(subset=["value"]).groupby(["element", "year"]).month.nunique()
+        full = ts.dropna(subset=["value"]).groupby(["element", "year"]).filter(lambda g: g.month.nunique() == 12)
         if daily:
             st.info("Annual summary is available in Monthly mode.")
         elif full.empty:
-            st.info("No complete calendar years in the selected range.")
+            gaps = ", ".join(f"{LABEL.get(el, el)} {y}: {n}/12 months" for (el, y), n in months_have.items() if n < 12)
+            st.info("No complete calendar years in the selected range. An annual total needs all 12 months "
+                    "(January–December) of a year. Pick a range that covers whole years, or click Fetch again "
+                    "to retry grids that failed to download." + (f"\n\nMissing data: {gaps}" if gaps else ""))
         else:
             for el in elements:
                 sub = full[full.element == el].groupby("year").value.sum() if el in ["ppt", "gdd"] else full[full.element == el].groupby("year").value.mean()
