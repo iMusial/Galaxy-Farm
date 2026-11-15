@@ -6,6 +6,8 @@ and pull PRISM climate data, growing degree days (GDD), and USDA NRCS SSURGO/STA
 
 Install:   pip install streamlit streamlit-folium folium requests numpy pandas plotly
 Run:       streamlit run prism_explorer.py
+Styling:   GalaxyFarm style guide (see the style-guide block below). Keep assets/starfield.jpg next to this file and
+           .streamlit/config.toml in the folder you run from for the full dark theme.
 
 Data Sources:
 - PRISM Climate Group, Oregon State University (https://prism.oregonstate.edu)
@@ -22,6 +24,8 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 import branca.colormap as bcm
@@ -56,15 +60,192 @@ LABEL = {
     "tmean": "Mean temp",
     "gdd": "Growing Degree Days",
 }
+# Style-guide palette (GREEN and PURPLE are chart accents taken from the mockups)
+BLACK, NAVY, INK = "#000000", "#001033", "#151622"
+RED_DARK, BLUE, WHITE, RED = "#B60109", "#3D9DC5", "#FFFFFF", "#D92C2F"
+BLUE_BRIGHT, GREEN, PURPLE = "#0088FF", "#07926B", "#A855C7"
 COLOR = {
-    "ppt": "#2b7bba",
-    "tmin": "#4a90d9",
-    "tmax": "#d9534f",
-    "tmean": "#e6a23c",
-    "gdd": "#27ae60",
+    "ppt": BLUE,
+    "tmin": PURPLE,
+    "tmax": RED,
+    "tmean": WHITE,
+    "gdd": GREEN,
 }
 MAX_FILES = 1500
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+# ------------------------------------------------------------------ style guide
+# GalaxyFarm style guide: deep-space palette, Inter (titles, buttons), Public Sans (headers, body), DM Mono (data),
+# 16 px left/right and 24 px top/bottom padding. All visual styling lives in this block, so restyling means editing only here.
+BRAND = "GalaxyFarm"
+ASSETS = Path(__file__).resolve().parent / "assets"  # starfield.jpg is optional; the page falls back to flat navy without it
+LOGO_B64 = "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"
+
+THEME_CSS = r"""
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&family=Public+Sans:wght@400;500;600;700&display=swap');
+:root{
+  --black:#000000; --navy:#001033; --ink:#151622; --red-dark:#B60109; --blue:#3D9DC5; --white:#FFFFFF;
+  --red:#D92C2F; --blue-bright:#0088FF; --green:#07926B;
+  --f-title:'Inter',system-ui,sans-serif; --f-body:'Public Sans','Inter',system-ui,sans-serif;
+  --f-mono:'DM Mono',ui-monospace,Menlo,Consolas,monospace;
+  --pad-x:16px; --pad-y:24px;
+}
+
+/* ---- page: starfield under a navy wash, black brand bar ---- */
+.stApp{
+  background:linear-gradient(180deg,rgba(0,16,51,.74) 0%,rgba(0,16,51,.46) 45%,rgba(21,22,34,.78) 100%),__STARS__;
+  color:var(--white); font-family:var(--f-body);
+}
+[data-testid="stAppViewContainer"],[data-testid="stMain"],section.main{background:transparent!important}
+[data-testid="stHeader"]{background:transparent!important}
+[data-testid="stMainBlockContainer"],.block-container{padding:0 var(--pad-x) var(--pad-y)!important;max-width:100%!important}
+.gf-bar{display:flex;align-items:center;gap:16px;height:64px;margin:0 calc(var(--pad-x) * -1);padding:0 var(--pad-x);
+  background:var(--black);color:var(--white);font:500 16px var(--f-body)}
+.gf-logo{width:32px;height:32px;border-radius:50%;background:center/cover no-repeat url("data:image/jpeg;base64,__LOGO__")}
+
+/* ---- type ---- */
+.stApp p,.stApp li,.stApp label,.stApp input,.stApp textarea,.stApp [data-baseweb="select"] div,
+.stApp [data-testid="stMarkdownContainer"]{font-family:var(--f-body)!important}
+.stApp button p{font-family:var(--f-title)!important}
+.stApp h1,.stApp h2,.stApp h3{font-family:var(--f-title)!important;color:var(--white)!important;letter-spacing:-.01em;
+  line-height:1.15!important;padding:var(--pad-y) 0 8px!important}
+.stApp h1{font-size:72px!important;font-weight:700!important}
+.stApp h2{font-size:48px!important;font-weight:600!important}
+.stApp h3{font-size:40px!important;font-weight:600!important}
+@media (max-width:900px){.stApp h1{font-size:44px!important}.stApp h2{font-size:32px!important}.stApp h3{font-size:26px!important}}
+.stApp a{color:var(--blue)} .stApp a:hover{color:var(--blue-bright)}
+.stApp hr,[data-testid="stDivider"] hr{border:0!important;border-top:1px solid rgba(255,255,255,.7)!important;margin:var(--pad-y) 0!important}
+[data-testid="stCaptionContainer"],[data-testid="stCaptionContainer"] p,.stApp [data-testid="stCaptionContainer"] p{
+  font-family:var(--f-mono)!important;font-size:12px!important;color:rgba(255,255,255,.82)!important}
+[data-testid="stWidgetLabel"] p{font-weight:600!important;color:var(--white)!important}
+
+/* ---- sidebar: black spec panel with underlined headers ---- */
+[data-testid="stSidebar"],[data-testid="stSidebar"]>div:first-child{background:var(--black)!important}
+[data-testid="stSidebar"] h2{font-family:var(--f-body)!important;font-size:22px!important;font-weight:700!important;text-align:center;
+  border-bottom:1px solid var(--white);padding:var(--pad-y) 0 8px!important;margin-bottom:8px}
+
+/* ---- panels (#151622 sections) and tabs ---- */
+[class*="st-key-panel_"]{background:var(--ink)!important;padding:var(--pad-y) var(--pad-x)!important;border-radius:0}
+.st-key-panel_plan{background:var(--black)!important}
+[data-testid="stTabs"] [role="tablist"]{background:var(--black);padding:0 var(--pad-x);gap:0}
+[data-testid="stTabs"] button[role="tab"]{padding:16px;color:rgba(255,255,255,.7)}
+[data-testid="stTabs"] button[role="tab"] p{font-size:16px!important;font-weight:600!important;color:inherit!important}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"]{color:var(--white)}
+[data-baseweb="tab-highlight"]{background-color:var(--blue)!important;height:3px!important}
+[data-baseweb="tab-border"]{background-color:rgba(255,255,255,.2)!important}
+[data-baseweb="tab-panel"]{background:var(--ink);padding:var(--pad-y) var(--pad-x)!important}
+[data-testid="stTabs"] h3,[data-testid="stExpander"] h3,[class*="st-key-panel_"] h3{font-family:var(--f-body)!important;
+  font-size:22px!important;font-weight:700!important;padding:var(--pad-y) 0 8px!important}
+
+/* ---- buttons: red primary, blue secondary (Inter 22) ---- */
+button[data-testid="stBaseButton-primary"],button[kind="primary"],button[data-testid="stBaseButton-secondary"],
+button[kind="secondary"],[data-testid="stDownloadButton"] button{
+  font-family:var(--f-title)!important;font-size:22px!important;font-weight:600!important;color:var(--white)!important;
+  border:none!important;border-radius:2px!important;padding:8px var(--pad-x)!important;line-height:1.2!important}
+.stApp button[data-testid="stBaseButton-primary"] p,.stApp button[data-testid="stBaseButton-secondary"] p,
+.stApp [data-testid="stDownloadButton"] button p,.stApp button[kind="primary"] p,.stApp button[kind="secondary"] p{
+  font-size:22px!important;font-weight:600!important;color:var(--white)!important}
+button[data-testid="stBaseButton-primary"],button[kind="primary"]{background:var(--red)!important}
+button[data-testid="stBaseButton-primary"]:hover,button[kind="primary"]:hover{background:var(--red-dark)!important}
+button[data-testid="stBaseButton-secondary"],button[kind="secondary"],[data-testid="stDownloadButton"] button{background:var(--blue)!important}
+button[data-testid="stBaseButton-secondary"]:hover,button[kind="secondary"]:hover,[data-testid="stDownloadButton"] button:hover{
+  background:var(--blue-bright)!important}
+.stApp button:disabled{opacity:.4!important}
+
+/* ---- inputs: white fields, blue chips ---- */
+[data-baseweb="input"],[data-baseweb="base-input"],[data-baseweb="textarea"],[data-baseweb="select"]>div{
+  background:#FFFFFF!important;border:none!important;border-radius:2px!important}
+.stApp input,.stApp textarea{color:#000!important;-webkit-text-fill-color:#000!important}
+.stApp input::placeholder{color:#5a5f6b!important;-webkit-text-fill-color:#5a5f6b!important}
+.stApp [data-baseweb="select"] *{color:#000!important} .stApp [data-baseweb="select"] svg{fill:#000!important}
+[data-baseweb="tag"]{background:var(--blue)!important;border-radius:2px!important}
+.stApp [data-baseweb="tag"] *{color:#FFFFFF!important} .stApp [data-baseweb="tag"] svg{fill:#FFFFFF!important}
+[data-baseweb="menu"],[data-baseweb="popover"] ul{background:#FFFFFF!important}
+[data-baseweb="menu"] li,[data-baseweb="popover"] li,[data-baseweb="menu"] [role="option"]{background:#FFFFFF!important;color:#000!important}
+[data-baseweb="menu"] li:hover,[data-baseweb="menu"] [role="option"]:hover,[data-baseweb="menu"] [aria-selected="true"]{
+  background:var(--blue)!important;color:#FFFFFF!important}
+[data-testid="stSliderThumbValue"],[data-testid="stTickBarMin"],[data-testid="stTickBarMax"]{font-family:var(--f-mono)!important}
+
+/* ---- metrics: black cards, Public Sans header, DM Mono data ---- */
+[data-testid="stMetric"]{background:var(--black);padding:var(--pad-y) var(--pad-x);text-align:center;align-items:center}
+[data-testid="stMetricLabel"]{justify-content:center}
+[data-testid="stMetricLabel"] p{font-size:18px!important;font-weight:700!important;color:var(--white)!important}
+[data-testid="stMetricValue"]{justify-content:center;font-family:var(--f-mono)!important;font-size:28px!important;font-weight:500!important}
+[data-testid="stMetricValue"] div{font-family:var(--f-mono)!important}
+
+/* ---- alerts, expanders, misc ---- */
+[data-testid="stAlert"]{background:rgba(0,0,0,.78)!important;border-left:4px solid var(--blue);border-radius:0!important}
+[data-testid="stAlert"] *{color:var(--white)!important}
+[data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]){border-left-color:var(--green)}
+[data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]){border-left-color:var(--red)}
+[data-testid="stAlert"]:has([data-testid="stAlertContentError"]){border-left-color:var(--red-dark)}
+[data-testid="stExpander"] details{background:var(--black);border:1px solid rgba(255,255,255,.2)!important;border-radius:0!important}
+[data-testid="stExpander"] summary p{font-weight:600!important}
+iframe{border:0}
+
+/* ---- loading: blue ring with a spinning black gap ---- */
+.pl-loading{display:flex;align-items:center;gap:16px;padding:var(--pad-y) 0}
+.pl-ring{width:44px;height:44px;flex:none;border-radius:50%;position:relative;
+  background:conic-gradient(var(--black) 0 25%,var(--blue) 25% 100%);animation:pl-spin 1s linear infinite}
+.pl-ring::after{content:"";position:absolute;inset:8px;border-radius:50%;background:var(--black)}
+.pl-loading span{font:400 12px var(--f-mono);color:var(--white)}
+@keyframes pl-spin{to{transform:rotate(360deg)}}
+"""
+
+
+@lru_cache(maxsize=1)
+def _stars_css():
+    fp = ASSETS / "starfield.jpg"
+    if fp.exists():
+        return f'url("data:image/jpeg;base64,{base64.b64encode(fp.read_bytes()).decode()}") center / cover no-repeat fixed'
+    return NAVY
+
+
+def inject_theme():
+    """Page CSS plus the black brand bar. One markdown call, so it adds no blank gap above the page."""
+    css = THEME_CSS.replace("__STARS__", _stars_css()).replace("__LOGO__", LOGO_B64)
+    css = re.sub(r"\s*\n\s*", " ", css)  # a blank line would end the HTML block and leak CSS onto the page
+    st.markdown(f"<style>{css}</style><div class='gf-bar'><div class='gf-logo'></div>{BRAND}</div>", unsafe_allow_html=True)
+
+
+def style_fig(fig):
+    """Charts sit straight on the starfield: transparent, white text, boxed white grid, centred Inter titles."""
+    fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font=dict(family="Public Sans, sans-serif", color=WHITE, size=13),
+                      title_font=dict(family="Inter, sans-serif", size=26, color=WHITE), title_x=0.5, title_xanchor="center",
+                      legend=dict(bgcolor="rgba(0,0,0,0)"), margin=dict(l=60, r=30, t=90, b=50))
+    axis = dict(gridcolor="rgba(255,255,255,0.35)", zerolinecolor="rgba(255,255,255,0.35)", showline=True, mirror=True,
+                linecolor="rgba(255,255,255,0.6)")
+    fig.update_xaxes(**axis)
+    fig.update_yaxes(**axis)
+    return fig
+
+
+def show_chart(fig, rule=False):
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+    if rule:
+        st.divider()  # thin white line between stacked charts
+
+
+@contextmanager
+def loading(msg="Loading…"):
+    """Style-guide loader (blue ring, spinning black gap) in place of st.spinner."""
+    slot = st.empty()
+    slot.markdown(f'<div class="pl-loading"><div class="pl-ring"></div><span>{msg}</span></div>', unsafe_allow_html=True)
+    try:
+        yield
+    finally:
+        slot.empty()
+
+
+def panel(name):
+    """A #151622 section panel (the style guide's content band). Falls back to a plain bordered box on old Streamlit."""
+    try:
+        return st.container(key=f"panel_{name}")
+    except TypeError:
+        return st.container(border=True)
+
 
 
 # ----------------------------------------------------------------- PRISM access
@@ -347,10 +528,10 @@ def ssurgo_tab(df):
         st.subheader(f"Profile of the largest component: {top.compname} ({int(top.comppct_r)}%)")
         mid = (prof.hzdept_r + prof.hzdepb_r) / 2
         f = go.Figure()
-        for col, lab, colr in [("claytotal_r", "Clay %", "#a1887f"), ("sandtotal_r", "Sand %", "#e6a23c"), ("om_r", "Organic matter %", "#2e7d32")]:
+        for col, lab, colr in [("claytotal_r", "Clay %", RED), ("sandtotal_r", "Sand %", WHITE), ("om_r", "Organic matter %", GREEN)]:
             f.add_scatter(x=prof[col], y=mid, name=lab, mode="lines+markers", line_color=colr)
         f.update_layout(yaxis=dict(autorange="reversed", title="Depth (cm)"), xaxis_title="percent", height=380)
-        st.plotly_chart(f, use_container_width=True)
+        show_chart(f)
         st.dataframe(prof[["hzname", "hzdept_r", "hzdepb_r", "claytotal_r", "sandtotal_r", "om_r", "awc_r"]].rename(columns={
             "hzname": "Horizon", "hzdept_r": "Top (cm)", "hzdepb_r": "Bottom (cm)", "claytotal_r": "Clay %",
             "sandtotal_r": "Sand %", "om_r": "Organic matter %", "awc_r": "Avail. water (cm/cm)"}),
@@ -417,8 +598,8 @@ def convert(df, units):
 
 # --------------------------------------------------------------------- map overlays
 SDM_WMS = "https://SDMDataAccess.sc.egov.usda.gov/Spatial/SDM.wms"
-RAMPS = {"ppt": ["#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"],
-         "temp": ["#313695", "#74add1", "#ffffbf", "#f46d43", "#a50026"]}
+RAMPS = {"ppt": ["#EAF6FB", "#9ED2E6", BLUE, "#0B5C8E", NAVY],
+         "temp": [BLUE_BRIGHT, BLUE, "#F2F2F2", RED, RED_DARK]}
 
 
 def add_reference_overlays(m):
@@ -510,10 +691,10 @@ def map_tab(d, units):
     layer.add_to(m)
     add_reference_overlays(m)
     if geom[0] == "poly":
-        folium.Polygon(locations=[(y, x) for x, y in geom[1]], color="#ff3b30", weight=3, fill=True,
+        folium.Polygon(locations=[(y, x) for x, y in geom[1]], color=RED, weight=3, fill=True,
                        fill_opacity=0.05, name="Your selection").add_to(m)
     else:
-        folium.CircleMarker(location=(geom[1][1], geom[1][0]), radius=7, color="#ff3b30", fill=True,
+        folium.CircleMarker(location=(geom[1][1], geom[1][0]), radius=7, color=RED, fill=True,
                             name="Your selection").add_to(m)
     cmap.add_to(m)
     m.fit_bounds(bounds)
@@ -524,8 +705,12 @@ def map_tab(d, units):
 
 
 # -------------------------------------------------------------------- heatmaps
-HEAT_SCALE = {"ppt": "Blues", "gdd": "YlOrRd", "tmin": "RdYlBu_r", "tmax": "RdYlBu_r", "tmean": "RdYlBu_r", "wet": "YlGnBu"}
-HEAT_ANOM = {"ppt": "BrBG", "wet": "BrBG"}  # wetter = green, drier = brown; temperatures use RdBu_r
+SEQ_BLUE = [[0, "#0B2A5B"], [0.5, BLUE], [1, WHITE]]
+SEQ_GREEN = [[0, "#0B2A5B"], [0.5, GREEN], [1, "#F2F2F2"]]
+DIVERGE = [[0, BLUE], [0.5, "#F2F2F2"], [1, RED]]    # cooler -> warmer
+WET_DRY = [[0, RED], [0.5, "#F2F2F2"], [1, BLUE]]    # drier -> wetter
+HEAT_SCALE = {"ppt": SEQ_BLUE, "gdd": SEQ_GREEN, "tmin": DIVERGE, "tmax": DIVERGE, "tmean": DIVERGE, "wet": SEQ_BLUE}
+HEAT_ANOM = {"ppt": WET_DRY, "wet": WET_DRY}  # wetter = blue, drier = red; everything else uses DIVERGE
 
 
 def make_heat(df, title, unit, key, daily, anomaly):
@@ -540,13 +725,13 @@ def make_heat(df, title, unit, key, daily, anomaly):
             z = z - z.mean(axis=0)  # difference from that calendar month's average across the selected years
         z.index = [str(int(i)) for i in z.index]
         x, xtitle = MONTHS, None
-    scale = (HEAT_ANOM.get(key, "RdBu_r") if anomaly else HEAT_SCALE.get(key, "Viridis"))
+    scale = (HEAT_ANOM.get(key, DIVERGE) if anomaly else HEAT_SCALE.get(key, SEQ_BLUE))
     sign = "+" if anomaly else ""
     fig = go.Figure(go.Heatmap(
         z=z.values, x=x, y=list(z.index), colorscale=scale, zmid=0 if anomaly else None, xgap=2, ygap=2,
         hoverongaps=False, colorbar=dict(title=unit),
         hovertemplate="%{y} · %{x}<br>%{z:" + sign + ".2f} " + unit + "<extra></extra>"))
-    fig.update_layout(title=title + (" (difference from the usual for that month)" if anomaly else ""),
+    fig.update_layout(title=title + ("<br><sup>difference from the usual for that month</sup>" if anomaly else ""),
                       height=int(min(720, max(260, 90 + 32 * len(z)))), yaxis=dict(autorange="reversed", type="category"),
                       xaxis=dict(title=xtitle, dtick=1 if daily else None))
     return fig
@@ -565,7 +750,7 @@ def heatmap_tab(ts, units, power, p_unit, t_unit):
         sub = ts[ts.element == el].dropna(subset=["value"])
         if sub.empty or (anomaly and sub.year.nunique() < 2):
             continue
-        st.plotly_chart(make_heat(sub, LABEL[el], unit_of.get(el, t_unit), el, daily, anomaly), use_container_width=True)
+        show_chart(make_heat(sub, LABEL[el], unit_of.get(el, t_unit), el, daily, anomaly))
         shown += 1
     if anomaly and not shown:
         st.info("The difference view needs at least two years of monthly data. Pick a longer range or switch to actual values.")
@@ -577,9 +762,9 @@ def heatmap_tab(ts, units, power, p_unit, t_unit):
         pdf = pd.DataFrame({"year": power.index.year, "month": power.index.month, "day": power.index.day,
                             "value": power[k].values}).dropna()
         if not pdf.empty and not (anomaly and pdf.year.nunique() < 2):
-            st.plotly_chart(make_heat(pdf, names[k], "0 = dry, 1 = saturated", "wet", daily, anomaly), use_container_width=True)
-    st.caption("Each cell is one month (or one day in Daily mode). Darker or redder means more. In the difference view, "
-               "red is warmer and brown is drier than that month's average across your selected years, and blue/green is the opposite.")
+            show_chart(make_heat(pdf, names[k], "0 = dry, 1 = saturated", "wet", daily, anomaly))
+    st.caption("Each cell is one month (or one day in Daily mode). Brighter means more. In the difference view, "
+               "red is warmer (or drier) than that month's average across your selected years, and blue is cooler (or wetter).")
 
 
 # ------------------------------------------------------------ rotation advisor
@@ -935,7 +1120,7 @@ def sources_section(res, d):
     store = st.session_state.setdefault("src_results", {})
     if st.button(f"Search the web ({cost} SerpApi search{'es' if cost != 1 else ''})", disabled=cost == 0, key="src_go"):
         found = {}
-        with st.spinner("Searching…"):
+        with loading("Searching…"):
             try:
                 if want_plant:  # first, since the plan depends on it most
                     found["plant"] = {x: serp_search.search(f"when to plant {x.lower()} {region} planting date extension "
@@ -1173,7 +1358,7 @@ def plan_section(res, fits, last, irrigated, info):
     lines += ["**What to do next**"] + [f"{i + 1}. {x}" for i, x in enumerate(steps)]
 
     st.subheader("Your plan")
-    with st.container(border=True):
+    with panel("plan"):
         st.markdown("\n".join(lines))
     st.download_button("Download this plan", "# Crop rotation plan\n\n" + "\n".join(lines).replace("**", ""),
                        file_name="rotation_plan.md", mime="text/markdown", key="plan_dl")
@@ -1234,8 +1419,8 @@ def fetch_power(geom, d0, d1):
 
 
 def power_tab(pw, ts, elements, daily, p_unit):
-    names = [("surface", "Surface (top ~5 cm)", "#8d6e63"), ("root", "Root zone (top ~1 m)", "#2e7d32"),
-             ("profile", "Full profile", "#1565c0")]
+    names = [("surface", "Surface (top ~5 cm)", PURPLE), ("root", "Root zone (top ~1 m)", GREEN),
+             ("profile", "Full profile", BLUE)]
     names = [n for n in names if n[0] in pw]
     cols = st.columns(len(names))
     for col, (k, lab, _) in zip(cols, names):
@@ -1245,13 +1430,14 @@ def power_tab(pw, ts, elements, daily, p_unit):
         f.add_scatter(x=pw.index, y=pw[k], name=lab, line_color=colr)
     f.update_layout(title="NASA POWER soil wetness (0 = dry, 1 = saturated)", yaxis_title="fraction of saturation",
                     yaxis_range=[0, 1], height=350)
-    st.plotly_chart(f, use_container_width=True)
+    show_chart(f)
 
 
 # ------------------------------------------------------------------------- UI
-st.set_page_config(page_title="PRISM Climate & NRCS Soil Explorer", layout="wide")
-st.title("🌎 PRISM Climate & NRCS Soil Explorer")
-st.caption("Search a place → draw your land on the map → get PRISM climate, GDD, and USDA SSURGO/STATSGO2 soil properties.")
+st.set_page_config(page_title=f"{BRAND} · PRISM Climate & NRCS Soil Explorer", layout="wide")
+inject_theme()
+st.title("PRISM Climate & NRCS Soil Explorer")
+st.markdown("Search a place → draw your land on the map → get PRISM climate, GDD, and USDA SSURGO/STATSGO2 soil properties.")
 
 ss = st.session_state
 ss.setdefault("center", [39.8, -98.6])
@@ -1263,7 +1449,7 @@ ss.setdefault("data", None)
 with st.sidebar:
     st.header("1 · Find your land")
     q = st.text_input("Search address, town, park, ranch…")
-    if st.button("Search", use_container_width=True) and q:
+    if st.button("Search", type="primary", use_container_width=True) and q:
         try:
             ss.results = geocode(q)
             if not ss.results:
@@ -1322,52 +1508,54 @@ SingleSelection().add_to(m)
 add_reference_overlays(m)  # off by default; switch on in the layer control
 folium.LayerControl().add_to(m)
 
-st.subheader("Draw a rectangle or polygon around your land (or drop a pin)")
-out = st_folium(m, height=520, use_container_width=True, key=f"map-{ss.map_v}", returned_objects=["all_drawings"])
-geom = parse_geom(out.get("all_drawings") if out else None)
+with panel("map"):
+    st.header("Draw your land on the map")
+    st.caption("Draw a rectangle or polygon around your land, or drop a pin.")
+    out = st_folium(m, height=520, use_container_width=True, key=f"map-{ss.map_v}", returned_objects=["all_drawings"])
+    geom = parse_geom(out.get("all_drawings") if out else None)
 
-if geom is None:
-    st.info("Use the toolbar on the left of the map to draw your selection.")
-else:
-    if geom[0] == "poly":
-        st.success(f"Selection: polygon, ≈ {approx_area_km2(geom[1]):.2f} km²")
+    if geom is None:
+        st.info("Use the toolbar on the left of the map to draw your selection.")
     else:
-        st.success(f"Selection: point at {geom[1][1]:.4f}, {geom[1][0]:.4f}")
-    if st.button("📊 Fetch data & soil properties", type="primary", disabled=not elements or not tasks or too_many):
-        df, missing, ncells = run_fetch(geom, tasks)
-        n_limit = sum(v.startswith("LIMIT") for v in ERRORS.values())
-        if n_limit:
-            st.warning(f"{n_limit} PRISM grids were skipped because PRISM only lets each file be downloaded twice "
-                       "a day. They will download normally tomorrow (Pacific time), and the app saves every "
-                       "grid it gets, so this won't recur for the same months.")
-        if df.empty or df.value.isna().all():
-            st.error("No data returned. PRISM covers the continental US only.")
-            ss.data = None
+        if geom[0] == "poly":
+            st.success(f"Selection: polygon, ≈ {approx_area_km2(geom[1]):.2f} km²")
         else:
-            if {"tmin", "tmax"} <= set(df.element):
-                base_c = (gdd_base - 32) * 5 / 9 if units.startswith("US") else float(gdd_base)
-                gdd_rows = compute_gdd_rows(df, base_c, mode == "Daily")
-                if not gdd_rows.empty:
-                    df = pd.concat([df, gdd_rows], ignore_index=True)
+            st.success(f"Selection: point at {geom[1][1]:.4f}, {geom[1][0]:.4f}")
+        if st.button("Fetch data & soil properties", type="primary", disabled=not elements or not tasks or too_many):
+            df, missing, ncells = run_fetch(geom, tasks)
+            n_limit = sum(v.startswith("LIMIT") for v in ERRORS.values())
+            if n_limit:
+                st.warning(f"{n_limit} PRISM grids were skipped because PRISM only lets each file be downloaded twice "
+                           "a day. They will download normally tomorrow (Pacific time), and the app saves every "
+                           "grid it gets, so this won't recur for the same months.")
+            if df.empty or df.value.isna().all():
+                st.error("No data returned. PRISM covers the continental US only.")
+                ss.data = None
+            else:
+                if {"tmin", "tmax"} <= set(df.element):
+                    base_c = (gdd_base - 32) * 5 / 9 if units.startswith("US") else float(gdd_base)
+                    gdd_rows = compute_gdd_rows(df, base_c, mode == "Daily")
+                    if not gdd_rows.empty:
+                        df = pd.concat([df, gdd_rows], ignore_index=True)
 
-            ssurgo_df = None
-            if want_ssurgo:
-                with st.spinner("Querying USDA NRCS SSURGO / STATSGO2 Soil Data Access..."):
-                    try:
-                        ssurgo_df = fetch_ssurgo_data(geom)
-                    except Exception as e:
-                        st.warning(f"Could not load soil data: {e}")
+                ssurgo_df = None
+                if want_ssurgo:
+                    with loading("Querying USDA NRCS SSURGO / STATSGO2 Soil Data Access..."):
+                        try:
+                            ssurgo_df = fetch_ssurgo_data(geom)
+                        except Exception as e:
+                            st.warning(f"Could not load soil data: {e}")
 
-            power = None
-            if want_power:
-                with st.spinner("Fetching NASA POWER soil wetness…"):
-                    try:
-                        power = fetch_power(geom, d0, d1)
-                    except Exception as e:
-                        st.warning(f"NASA POWER: {e}")
+                power = None
+                if want_power:
+                    with loading("Fetching NASA POWER soil wetness…"):
+                        try:
+                            power = fetch_power(geom, d0, d1)
+                        except Exception as e:
+                            st.warning(f"NASA POWER: {e}")
 
-            ss.data = dict(df=df, missing=missing, ncells=ncells, mode=mode, d0=d0, d1=d1, geom=geom,
-                           ssurgo_df=ssurgo_df, power=power)
+                ss.data = dict(df=df, missing=missing, ncells=ncells, mode=mode, d0=d0, d1=d1, geom=geom,
+                               ssurgo_df=ssurgo_df, power=power)
 
 if ss.data and geom is not None and ss.data.get("geom") != geom:
     ss.data = None
@@ -1399,9 +1587,9 @@ if ss.data:
             sub = ts[ts.element == el]
             if sub.empty:
                 continue
-            f = go.Figure(go.Scatter(x=sub.date, y=sub.value, mode="lines+markers", name=LABEL[el], line_color=COLOR.get(el, "#333")))
+            f = go.Figure(go.Scatter(x=sub.date, y=sub.value, mode="lines+markers", name=LABEL[el], line_color=COLOR.get(el, WHITE)))
             f.update_layout(title=f"{step} {LABEL[el]}", yaxis_title=f"{p_unit if el=='ppt' else ('°F-days' if el=='gdd' and not units.startswith('Metric') else ('°C-days' if el=='gdd' else t_unit))}", height=320)
-            st.plotly_chart(f, use_container_width=True)
+            show_chart(f, rule=True)
 
     with t2:
         if daily:
@@ -1419,9 +1607,9 @@ if ss.data:
                 sub = avg[avg.element == el]
                 if sub.empty:
                     continue
-                f = go.Figure(go.Bar(x=[MONTHS[m - 1] for m in sub.month], y=sub.value, marker_color=COLOR.get(el, "#333")))
+                f = go.Figure(go.Bar(x=[MONTHS[m - 1] for m in sub.month], y=sub.value, marker_color=COLOR.get(el, WHITE)))
                 f.update_layout(title=f"Average monthly {LABEL[el]}", height=320)
-                st.plotly_chart(f, use_container_width=True)
+                show_chart(f, rule=True)
 
     with t3:
         months_have = ts.dropna(subset=["value"]).groupby(["element", "year"]).month.nunique()
@@ -1439,9 +1627,9 @@ if ss.data:
                 sub = sub.reset_index()
                 if sub.empty:
                     continue
-                f = go.Figure(go.Bar(x=sub.year, y=sub.value, marker_color=COLOR.get(el, "#333")))
+                f = go.Figure(go.Bar(x=sub.year, y=sub.value, marker_color=COLOR.get(el, WHITE)))
                 f.update_layout(title=f"Annual {LABEL[el]}", height=300, xaxis=dict(dtick=1))
-                st.plotly_chart(f, use_container_width=True)
+                show_chart(f, rule=True)
 
     with t4:
         wide = df.pivot_table(index=["kind", "year", "month", "day"], columns="element", values="value").reset_index()

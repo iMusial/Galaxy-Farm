@@ -1,0 +1,9 @@
+# GalaxyFarm style guide: dark base, blue as the accent (radios, sliders, tabs, progress),
+# #151622 for data panels, black for the sidebar. Red primary buttons are set in the script's CSS.
+[theme]
+base = "dark"
+primaryColor = "#3D9DC5"
+backgroundColor = "#151622"
+secondaryBackgroundColor = "#000000"
+textColor = "#FFFFFF"
+font = "sans serif"
