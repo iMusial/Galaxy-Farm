@@ -38,6 +38,13 @@ from folium.raster_layers import ImageOverlay
 from PIL import Image  # installed with streamlit
 from streamlit_folium import st_folium
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # serp_search.py lives in the repo root
+try:
+    import serp_search
+except ImportError:
+    serp_search = None
+
 BASE = "https://services.nacse.org/prism/data/get/us/4km"
 ERRORS = {}  # url -> last failure reason
 CACHE = Path(__file__).resolve().parent / "prism_cache"  # same cache no matter where the app is started from
@@ -362,6 +369,20 @@ def geocode(q):
     )
     r.raise_for_status()
     return r.json()
+
+
+@st.cache_data(show_spinner=False)
+def place_name(lat, lon):
+    """(state, county) for a point, via OpenStreetMap reverse geocoding."""
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/reverse",
+        params=dict(lat=lat, lon=lon, format="json", zoom=8),
+        headers={"User-Agent": "prism-explorer-demo/1.0"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    a = r.json().get("address", {})
+    return a.get("state"), a.get("county")
 
 
 def parse_geom(drawings):
@@ -836,9 +857,273 @@ def rotation_tab(d):
     with st.expander("Crop traits used by the advisor"):
         st.dataframe(pd.DataFrame(CROPS).drop(columns=["drain"]).assign(drain=[f"{c['drain'][0]}–{c['drain'][1]}" for c in CROPS]),
                      hide_index=True, use_container_width=True)
+    info = sources_section(res, d)
+    plan_section(res, fits, last, irrigated, info)
     st.caption("Screening tool, not agronomic advice. Crop traits are approximate starter values (editable in the CROPS table at the top "
                "of this section). The advisor does not see field history, pests and disease, soil pH and nutrients, prices, or equipment, "
                "so check any rotation with a local extension agent.")
+
+
+# ------------------------------------------------------- outside sources (SerpApi)
+def _md(text):
+    """Make search text safe for st.markdown (no broken links, no stray LaTeX)."""
+    return (text or "").replace("[", "(").replace("]", ")").replace("$", "\\$").replace("\n", " ")
+
+
+def _links(items):
+    if not items:
+        st.caption("Nothing found.")
+        return
+    for it in items:
+        meta = " · ".join(_md(x) for x in (it.get("source"), it.get("date")) if x)
+        st.markdown(f"- [{_md(it['title'])}]({it['link']})" + (f"  \n  *{meta}*" if meta else "")
+                    + (f"  \n  {_md(it['snippet'])}" if it.get("snippet") else ""))
+
+
+def cycle_pairs(seq):
+    """Each (previous, next) crop change in a repeating cycle, in order, without repeats or same-crop pairs."""
+    return [p for p in dict.fromkeys(zip(seq, seq[1:] + seq[:1])) if p[0] != p[1]]
+
+
+def sources_section(res, d):
+    st.subheader("Check it against outside sources")
+    if serp_search is None or not serp_search.have_key():
+        st.caption("ℹ️ Add a SerpApi key (see the project README) to look up extension guides, research, and "
+                   "cover-crop advice for these rotations.")
+        return None
+    labels = [" → ".join(seq) for _, seq in res]
+    pick = st.selectbox("Rotation to look up", range(len(res)), format_func=lambda i: f"#{i + 1}: {labels[i]}", key="src_pick")
+    seq = res[pick][1]
+
+    kind, c = d["geom"]
+    lon, lat = c if kind == "point" else np.array(c).mean(axis=0)
+    try:
+        state, county = place_name(round(float(lat), 3), round(float(lon), 3))
+    except Exception:
+        state = county = None
+    region = state or ""
+    pairs = cycle_pairs(seq)
+    cover_pairs = [p for p in pairs if p[1] != "Winter wheat"]  # wheat is sown right after harvest: no cover-crop window
+
+    crops = list(dict.fromkeys(seq))
+    cols = st.columns(4)
+    want_plant = cols[3].checkbox("Planting dates", True, key="src_plant",
+                                  help="Local planting window for each crop, used in the plan below (1 search per crop).")
+    want_ext = cols[0].checkbox("Extension guides", True, key="src_ext",
+                                help="University extension pages about this crop mix in your state (1 search).")
+    want_sch = cols[1].checkbox("Research on each crop change", True, key="src_sch",
+                                help="Google Scholar studies on how each crop does after the one before it (1 search per change).")
+    want_cov = cols[2].checkbox("Cover crops between crops", True, key="src_cov",
+                                help="Extension advice on a cover crop for each gap (1 search per gap; skipped before winter wheat).")
+    cost = want_ext + want_sch * len(pairs) + want_cov * len(cover_pairs) + want_plant * len(crops)
+    st.caption(f"Searching for: **{', '.join(x for x in (county, state) if x) or 'location unknown, so searching nationally'}**. "
+               "Results are saved for this session, so looking again costs nothing.")
+
+    key = (tuple(seq), region)
+    store = st.session_state.setdefault("src_results", {})
+    if st.button(f"Search the web ({cost} SerpApi search{'es' if cost != 1 else ''})", disabled=cost == 0, key="src_go"):
+        found = {}
+        with st.spinner("Searching…"):
+            try:
+                if want_plant:  # first, since the plan depends on it most
+                    found["plant"] = {x: serp_search.search(f"when to plant {x.lower()} {region} planting date extension", num=6)
+                                      for x in crops}
+                if want_ext:
+                    found["ext"] = serp_search.search(f"{' '.join(x.lower() for x in crops)} crop rotation {region} extension site:edu", num=5)
+                if want_sch:
+                    found["sch"] = {p: serp_search.search(f"{p[1].lower()} following {p[0].lower()} rotation yield",
+                                                          num=3, engine="google_scholar") for p in pairs}
+                if want_cov:
+                    found["cov"] = {p: serp_search.search(f"cover crop after {p[0].lower()} before {p[1].lower()} {region} site:edu",
+                                                          num=3) for p in cover_pairs}
+            except Exception as e:
+                st.error(f"Search stopped: {e}")
+        old = store.get(key, {})
+        for k, v in found.items():  # keep anything found, even if a later search failed
+            old[k] = {**old.get(k, {}), **v} if isinstance(v, dict) else v
+        store[key] = old
+
+    got = store.get(key)
+    info = dict(seq=seq, got=got or {}, state=state, county=county)
+    if not got:
+        return info
+    if "plant" in got:
+        st.markdown(f"**Planting dates{' in ' + state if state else ''}**")
+        for x, items in got["plant"].items():
+            w = planting_window(items, CROP[x])
+            with st.expander(f"{x}: {w[0] if w else 'no clear date found'}"):
+                _links(items)
+    if "ext" in got:
+        st.markdown(f"**Extension guides{' for ' + state if state else ''}**")
+        _links(got["ext"])
+    if "sch" in got:
+        st.markdown("**Research on each crop change**")
+        for (a, b), items in got["sch"].items():
+            with st.expander(f"{b} after {a.lower()}"):
+                _links(items)
+    if "cov" in got:
+        st.markdown("**Cover crops between crops**")
+        for (a, b), items in got["cov"].items():
+            with st.expander(f"Between {a.lower()} and {b.lower()}"):
+                _links(items)
+    st.caption("These are web search results, not checked by the advisor. Read the source before acting on it.")
+    return info
+
+
+# ------------------------------------------------------------ final plan for the farmer
+COVER_NAMES = ["cereal rye", "winter rye", "annual ryegrass", "triticale", "oats", "barley", "hairy vetch", "crimson clover",
+               "red clover", "white clover", "berseem clover", "field peas", "austrian winter pea", "radish", "turnip",
+               "sorghum-sudangrass", "cowpea", "sunn hemp", "buckwheat", "mustard"]
+EARLY_HARVEST = {"Winter wheat", "Spring wheat", "Barley", "Oats", "Field peas", "Canola"}  # leaves a long late-summer window
+
+
+def default_cover(a, b):
+    """Common starting-point cover crop for the gap between crop a's harvest and crop b's planting."""
+    if b == "Winter wheat":
+        return None, "skip the cover crop. Winter wheat goes in soon after harvest and covers the ground over winter"
+    if a in EARLY_HARVEST and CROP[b]["n"] == "heavy":
+        return "red clover or hairy vetch", f"a legume has time to grow after the early {a.lower()} harvest and adds nitrogen for {b.lower()}"
+    if CROP[b]["n"] == "fix":
+        return "cereal rye", f"a grass soaks up leftover nitrogen; end it 2-3 weeks before planting {b.lower()}"
+    if CROP[b]["n"] == "heavy":
+        return "cereal rye, or a rye + hairy vetch mix", f"protects the soil over winter; the vetch adds some nitrogen for {b.lower()}"
+    return "cereal rye or oats", "protects the soil over winter and builds organic matter"
+
+
+def mentioned_cover(items):
+    """Cover crop named most often in the search results for one gap, or None."""
+    text = " ".join(f"{i.get('title') or ''} {i.get('snippet') or ''}" for i in items or []).lower()
+    counts = {n: text.count(n) for n in COVER_NAMES if text.count(n)}
+    return max(counts, key=counts.get) if counts else None
+
+
+# Month names in any case, except a bare lowercase "may" (almost always the verb) unless a day number follows.
+_MONTH = (r"(?:(?i:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?"
+          r"|nov(?:ember)?|dec(?:ember)?)|May|(?i:may)(?=\s+\d))\b\.?")
+_POINT = (rf"(?:(?i:early|mid|late)[- ]?)?{_MONTH}(?!\s+\d{{1,2}},?\s*\d{{4}})"  # skip 'June 5, 2009' and 'June 2009'
+          rf"(?:\s+\d{{1,2}}(?:st|nd|rd|th)?\b)?(?!,?\s*\d{{4}})")                  # (report dates, not advice)
+_RANGE = re.compile(rf"\b({_POINT})\s*(?:to|through|until|and|or|-|–|—)\s*({_POINT})")
+_MNUM = {m: i + 1 for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_MNAME = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+
+def _month_of(point):
+    return _MNUM[re.search(_MONTH, point).group(0)[:3].lower()]
+
+
+def _tidy(point):
+    p = re.sub(r"\s+", " ", point.strip()).replace("mid ", "mid-")
+    return re.sub(_MONTH, lambda m: _MNAME[_MNUM[m.group(0)[:3].lower()]], p)  # 'sept.' -> 'September'
+
+
+def planting_window(items, crop):
+    """Planting window quoted in search snippets -> (text, source item) or None.
+
+    Prefers an explicit range ('late April to mid-May'); otherwise falls back to the months most often named
+    ('around April to May'). Only sentences about planting/seeding count, and months must fit the crop's season
+    (Aug-Dec for overwintering crops, Feb-Jul otherwise), so harvest dates and report dates are ignored.
+    """
+    fall = crop["ffd"] == 0
+    in_season = (lambda m: 8 <= m <= 12) if fall else (lambda m: 2 <= m <= 7)
+    votes, first, months = {}, {}, {}
+    for it in items or []:
+        for sent in re.split(r"(?<=[.!?])\s+|\s?\.\.\.\s?", it.get("snippet") or ""):
+            if not re.search(r"plant|seed|sow", sent, re.I):
+                continue
+            for a, b in _RANGE.findall(sent):
+                ma, mb = _month_of(a), _month_of(b)
+                if in_season(ma) and in_season(mb) and ma <= mb:
+                    text = f"{_tidy(a)} to {_tidy(b)}"
+                    votes[text.lower()] = votes.get(text.lower(), 0) + 1
+                    first.setdefault(text.lower(), (text, it))
+            for m in {_month_of(p) for p in re.findall(_POINT, sent)}:
+                if in_season(m):
+                    n, src = months.get(m, (0, it))
+                    months[m] = (n + 1, src)
+    if votes:
+        return first[max(votes, key=votes.get)]
+    if not months:
+        return None
+    top = max(n for n, _ in months.values())
+    keep = sorted(m for m, (n, _) in months.items() if n * 2 >= top)  # months named at least half as often as the leader
+    if keep[-1] - keep[0] > 2:  # sources disagree too much to give one window
+        return None
+    src = months[max(keep, key=lambda m: months[m][0])][1]
+    text = _MNAME[keep[0]] + ("" if len(keep) == 1 else f" to {_MNAME[keep[-1]]}")
+    return f"around {text}", src
+
+
+def fertility_note(c, p):
+    if c["n"] == "fix":
+        return "Usually needs little or no nitrogen fertilizer."
+    if c["n"] == "heavy" and p["n"] == "fix":
+        return f"Count the nitrogen {p['name'].lower()} left behind; a soil test will likely show you can apply less."
+    if c["n"] == "heavy" and p["n"] == "heavy":
+        return f"Plan full nitrogen; {p['name'].lower()} used most of it up."
+    if c["n"] == "heavy":
+        return "Heavy nitrogen user: plan fertilizer from a soil test."
+    return "Moderate fertility needs: fertilize to a soil test."
+
+
+def plan_section(res, fits, last, irrigated, info):
+    seq = info["seq"] if info else res[0][1]
+    got = info["got"] if info else {}
+    state, county = (info["state"], info["county"]) if info else (None, None)
+    avg = round(100 * np.mean([fits[x][0] for x in seq]))
+    legume = next((x for x in seq if CROP[x]["n"] == "fix"), None)
+
+    lines = [f"**Grow {' → '.join(seq)}, then start over.** Average fit for your site: {avg}%."
+             + (f" Growing {legume.lower()} feeds nitrogen to the next crop." if legume else " There is no legume, so plan on more nitrogen fertilizer.")]
+    if last:
+        lines.append(f"Coming off {last['name'].lower()}, start with **{seq[0]}**: " + explain_year(0, seq, last).split(";")[0] + ".")
+    lines.append("")
+    for i, crop in enumerate(seq):
+        prev = CROP[seq[i - 1] if i > 0 else (last["name"] if last else seq[-1])]
+        nxt = seq[(i + 1) % len(seq)]
+        lines.append(f"**Year {i + 1}: plant {crop}**")
+        if "plant" in got:
+            w = planting_window(got["plant"].get(crop), CROP[crop])
+            lines.append(f"- When to plant: **{w[0]}** (local source: [{_md(w[1]['title'])}]({w[1]['link']}))." if w else
+                         "- When to plant: local sources didn't give a clear date; ask your extension office.")
+        lines.append(f"- Fertility: {fertility_note(CROP[crop], prev)}")
+        watch = [n for n in fits[crop][2] if n != "comfortable fit"]
+        if watch:
+            tip = " Choose a drought-tolerant variety or plan irrigation." if any("rain" in w for w in watch) and not irrigated else ""
+            lines.append(f"- Watch: {'; '.join(watch)}.{tip}")
+        if crop == nxt:
+            continue
+        cover, why = default_cover(crop, nxt)
+        local = mentioned_cover(got.get("cov", {}).get((crop, nxt)))
+        if cover is None:
+            lines.append(f"- After harvest: {why}.")
+        elif local and local not in cover:
+            lines.append(f"- After harvest: sow a cover crop before {nxt.lower()}. Local sources mention **{local}**; "
+                         f"{cover} is the usual default ({why}).")
+        else:
+            lines.append(f"- After harvest: sow **{local or cover}** as a cover crop before {nxt.lower()} ({why})."
+                         + (" Local sources agree." if local else ""))
+        lines.append("")
+
+    where = ", ".join(x for x in (county, state) if x)
+    ext = (got.get("ext") or [None])[0]
+    w1 = planting_window(got.get("plant", {}).get(seq[0]), CROP[seq[0]])
+    steps = [
+        f"Get a soil test (pH, phosphorus, potassium) before planting {seq[0].lower()}"
+        + (f" ({w1[0]})" if w1 else "") + ". The advisor can't see soil nutrients.",
+        f"Line up cover crop seed before the year 1 harvest so it can be sown right away.",
+        f"Check the plan with your {'county ' if county else ''}extension office{' in ' + where if where else ''}"
+        + (f", starting with [{_md(ext['title'])}]({ext['link']})." if ext else "."),
+        "Before committing acres, check that you have a buyer and the equipment for every crop in the cycle.",
+    ]
+    if not info or not got:
+        steps.append("For local planting dates, cover crops, and research backing, run the outside-source search above.")
+    lines += ["**What to do next**"] + [f"{i + 1}. {x}" for i, x in enumerate(steps)]
+
+    st.subheader("Your plan")
+    with st.container(border=True):
+        st.markdown("\n".join(lines))
+    st.download_button("Download this plan", "# Crop rotation plan\n\n" + "\n".join(lines).replace("**", ""),
+                       file_name="rotation_plan.md", mime="text/markdown", key="plan_dl")
 
 
 class SingleSelection(MacroElement):
