@@ -92,11 +92,11 @@ THEME_CSS = r"""
   --pad-x:16px; --pad-y:24px;
 }
 
-/* ---- page: starfield under a navy wash, black brand bar ---- */
+/* ---- page: starfield image at 36% opacity over navy, black brand bar ---- */
 .stApp{
-  background:linear-gradient(180deg,rgba(0,16,51,.74) 0%,rgba(0,16,51,.46) 45%,rgba(21,22,34,.78) 100%),__STARS__;
-  color:var(--white); font-family:var(--f-body);
-}
+  /* a 64% navy sheet over the image = the starfield at 36% opacity, with no stacking tricks */
+  background:linear-gradient(rgba(0,16,51,.64),rgba(0,16,51,.64)),__STARS__ center / cover no-repeat fixed,#001033;
+  color:var(--white);font-family:var(--f-body)}
 [data-testid="stAppViewContainer"],[data-testid="stMain"],section.main{background:transparent!important}
 [data-testid="stHeader"]{background:transparent!important}
 [data-testid="stMainBlockContainer"],.block-container{padding:0 var(--pad-x) var(--pad-y)!important;max-width:100%!important}
@@ -128,13 +128,13 @@ THEME_CSS = r"""
 /* ---- panels (#151622 sections) and tabs ---- */
 [class*="st-key-panel_"]{background:var(--ink)!important;padding:var(--pad-y) var(--pad-x)!important;border-radius:0}
 .st-key-panel_plan{background:var(--black)!important}
-[data-testid="stTabs"] [role="tablist"]{background:var(--black);padding:0 var(--pad-x);gap:0}
-[data-testid="stTabs"] button[role="tab"]{padding:16px;color:rgba(255,255,255,.7)}
+[data-testid="stTabs"] [role="tablist"]{background:var(--black);gap:16px;padding:0 var(--pad-x);overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap}
+[data-testid="stTabs"] button[role="tab"]{flex:0 0 auto;white-space:nowrap;padding:16px 8px;margin:0;color:rgba(255,255,255,.7);
+  border-bottom:3px solid transparent;border-radius:0;position:static}
 [data-testid="stTabs"] button[role="tab"] p{font-size:16px!important;font-weight:600!important;color:inherit!important}
-[data-testid="stTabs"] button[role="tab"][aria-selected="true"]{color:var(--white)}
-[data-baseweb="tab-highlight"]{background-color:var(--blue)!important;height:3px!important}
-[data-baseweb="tab-border"]{background-color:rgba(255,255,255,.2)!important}
-[data-baseweb="tab-panel"]{background:var(--ink);padding:var(--pad-y) var(--pad-x)!important}
+[data-testid="stTabs"] button[role="tab"][aria-selected="true"]{color:var(--white);border-bottom-color:var(--blue)}
+[data-baseweb="tab-highlight"],[data-baseweb="tab-border"]{display:none!important}
+[data-baseweb="tab-panel"]{position:relative;clear:both;background:var(--ink);padding:var(--pad-y) var(--pad-x)!important}
 [data-testid="stTabs"] h3,[data-testid="stExpander"] h3,[class*="st-key-panel_"] h3{font-family:var(--f-body)!important;
   font-size:22px!important;font-weight:700!important;padding:var(--pad-y) 0 8px!important}
 
@@ -198,8 +198,8 @@ iframe{border:0}
 def _stars_css():
     fp = ASSETS / "starfield.jpg"
     if fp.exists():
-        return f'url("data:image/jpeg;base64,{base64.b64encode(fp.read_bytes()).decode()}") center / cover no-repeat fixed'
-    return NAVY
+        return f'url("data:image/jpeg;base64,{base64.b64encode(fp.read_bytes()).decode()}")'
+    return "linear-gradient(#001033,#001033)"
 
 
 def inject_theme():
