@@ -12,14 +12,61 @@ Usage:
     if have_key():
         results = search("Iowa cereal rye termination soybean site:iastate.edu")
 """
+import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
 ENDPOINT = "https://serpapi.com/search.json"
 ROOT = Path(__file__).parent
-_cache = {}  # search params -> results, so reruns don't spend extra searches
+# Results are kept in memory and in a git-ignored file, so restarts and reruns don't spend the same search twice.
+DISK_CACHE = ROOT / ".serp_cache.json"
+MAX_AGE_DAYS = 30
+_cache = None  # json(params) -> {"t": unix time, "results": [...]}
+_lock = threading.Lock()
+
+
+def _load():
+    global _cache
+    if _cache is None:
+        try:
+            _cache = json.loads(DISK_CACHE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _cache = {}
+    return _cache
+
+
+def _save():
+    try:
+        tmp = DISK_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_cache, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(DISK_CACHE)
+    except OSError:
+        pass  # read-only disk: the in-memory copy still works
+
+
+def _resolve_links(items):
+    """Google now returns google.com/goto redirect links. Follow each redirect once (no page download) so results
+    carry the real URL and its domain, which callers use to judge the source. Leaves the link as-is on failure."""
+    def one(it):
+        link = it.get("link") or ""
+        if urlparse(link).netloc.endswith("google.com"):
+            try:
+                # GET, not HEAD: Google answers HEAD with a plain 200. stream=True reads only the redirect response.
+                with requests.get(link, allow_redirects=False, timeout=8, stream=True) as r:
+                    if r.headers.get("location", "").startswith("http"):
+                        link = it["link"] = r.headers["location"]
+            except requests.RequestException:
+                pass
+        it["domain"] = urlparse(link).netloc.lower().removeprefix("www.")
+
+    with ThreadPoolExecutor(6) as ex:
+        list(ex.map(one, items))
 
 
 def get_key():
@@ -63,13 +110,15 @@ def search(query, num=5, location=None, engine="google", **extra):
     params = {"engine": engine, "q": query, "num": num, **extra}
     if location:
         params["location"] = location
-    ck = tuple(sorted(params.items()))
-    if ck in _cache:
-        return _cache[ck]
+    ck = json.dumps(params, sort_keys=True)
+    with _lock:
+        hit = _load().get(ck)
+    if hit and time.time() - hit["t"] < MAX_AGE_DAYS * 86400:
+        return hit["results"]
     key = get_key()
     if not key:
         raise RuntimeError("No SerpApi key. Put SERPAPI_KEY in .streamlit/secrets.toml (see README).")
-    r = requests.get(ENDPOINT, params={**params, "api_key": key}, timeout=20)
+    r = requests.get(ENDPOINT, params={**params, "api_key": key}, timeout=45)
     r.raise_for_status()
     data = r.json()
     if "error" in data:
@@ -78,9 +127,13 @@ def search(query, num=5, location=None, engine="google", **extra):
         else:
             raise RuntimeError(f"SerpApi: {data['error']}")
     out = [{"title": o.get("title"), "link": o.get("link"), "snippet": o.get("snippet"), "date": o.get("date"),
+            "site": o.get("source") if isinstance(o.get("source"), str) else None,  # e.g. "Mississippi Soybean Promotion Board"
             "source": (o.get("publication_info") or {}).get("summary")}  # authors/journal/year on Scholar
            for o in data.get("organic_results", [])[:num]]
-    _cache[ck] = out
+    _resolve_links(out)
+    with _lock:
+        _load()[ck] = {"t": time.time(), "results": out}
+        _save()
     return out
 
 

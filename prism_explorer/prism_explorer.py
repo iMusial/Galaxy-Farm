@@ -676,6 +676,14 @@ def build_site(raw, ssurgo_df, daily):
     return site
 
 
+def apply_tile_drainage(site):
+    """Field has drain tile: score wet soils as moderately well drained, which is what tiling achieves."""
+    if site.get("drain_rank") is not None and site["drain_rank"] > DRAIN_RANK["moderately well drained"]:
+        site["drain_rank"] = DRAIN_RANK["moderately well drained"]
+        site["drain_name"] = f"{site['drain_name']} (tile-drained)"
+    return site
+
+
 def crop_fit(c, site, irrigated):
     """-> (score 0-1, hard-fail reason or None, notes)"""
     if site.get("drain_rank") is not None and not (c["drain"][0] <= site["drain_rank"] <= c["drain"][1]):
@@ -788,6 +796,10 @@ def rotation_tab(d):
     site = build_site(raw, d.get("ssurgo_df"), daily)
 
     st.subheader("Site profile from your data")
+    if site.get("drain_rank") is not None and site["drain_rank"] > DRAIN_RANK["moderately well drained"]:
+        if st.checkbox(f"The field has tile drainage (soil maps call it {site['drain_name'].lower()})", key="rot_tile",
+                       help="Drain tile lets most crops grow on wet soils. When ticked, the soil is scored as moderately well drained."):
+            apply_tile_drainage(site)
     c = st.columns(4)
     c[0].metric("Heat, cool year (Apr–Oct)", f"{site['gdd_cool']:.0f} °C-days" if "gdd_cool" in site else "n/a")
     c[1].metric("Rain, dry year (Apr–Oct)", f"{site['rain_cool']:.0f} mm" if "rain_cool" in site else "n/a")
@@ -875,7 +887,7 @@ def _links(items):
         st.caption("Nothing found.")
         return
     for it in items:
-        meta = " · ".join(_md(x) for x in (it.get("source"), it.get("date")) if x)
+        meta = " · ".join(_md(x) for x in (it.get("site") or it.get("domain"), it.get("source"), it.get("date")) if x)
         st.markdown(f"- [{_md(it['title'])}]({it['link']})" + (f"  \n  *{meta}*" if meta else "")
                     + (f"  \n  {_md(it['snippet'])}" if it.get("snippet") else ""))
 
@@ -926,7 +938,8 @@ def sources_section(res, d):
         with st.spinner("Searching…"):
             try:
                 if want_plant:  # first, since the plan depends on it most
-                    found["plant"] = {x: serp_search.search(f"when to plant {x.lower()} {region} planting date extension", num=6)
+                    found["plant"] = {x: serp_search.search(f"when to plant {x.lower()} {region} planting date extension "
+                                                            "-garden -vegetable -almanac", num=8)
                                       for x in crops}
                 if want_ext:
                     found["ext"] = serp_search.search(f"{' '.join(x.lower() for x in crops)} crop rotation {region} extension site:edu", num=5)
@@ -990,9 +1003,44 @@ def default_cover(a, b):
     return "cereal rye or oats", "protects the soil over winter and builds organic matter"
 
 
+_SOCIAL = ("facebook.com", "reddit.com", "quora.com", "youtube.com", "tiktok.com", "instagram.com", "pinterest.com",
+           "x.com", "twitter.com", "almanac.com")
+_US_TLDS = (".edu", ".gov", ".org", ".com", ".net", ".us", ".coop", ".info")
+
+
+def trusted_source(item):
+    """Is this search result fit to base farm advice on? Rules out social media, home-garden/almanac pages, blogs
+    and foreign-country sites (often unrelated or spam for a US farm). Results without a resolved domain are allowed."""
+    domain = (item.get("domain") or "").lower()
+    text = f"{item.get('title') or ''} {item.get('site') or ''} {domain}".lower()
+    if any(domain == s or domain.endswith("." + s) for s in _SOCIAL):
+        return False
+    if re.search(r"\b(facebook|reddit|quora|youtube|tiktok|instagram|pinterest)\b", (item.get("site") or "").lower()):
+        return False  # also catches links that couldn't be resolved to a real domain
+    if re.search(r"garden|vegetable|almanac|backyard|homestead", text) or "blog" in domain:
+        return False
+    return not domain or domain.endswith(_US_TLDS)
+
+
+def official_source(item):
+    """University, government, extension or USDA site: preferred over other trusted sources."""
+    domain = (item.get("domain") or "").lower()
+    return trusted_source(item) and (domain.endswith((".edu", ".gov")) or bool(re.search(r"extension|usda", domain)))
+
+
+def prefer_official(items, pick):
+    """pick(official results) if that finds something, else pick(other trusted results)."""
+    items = [i for i in items or [] if trusted_source(i)]
+    return pick([i for i in items if official_source(i)]) or pick(items)
+
+
+def source_name(item):
+    return item.get("site") or item.get("domain") or "web search result"
+
+
 def mentioned_cover(items):
     """Cover crop named most often in the search results for one gap, or None."""
-    text = " ".join(f"{i.get('title') or ''} {i.get('snippet') or ''}" for i in items or []).lower()
+    text = " ".join(f"{i.get('title') or ''} {i.get('snippet') or ''}" for i in items or [] if trusted_source(i)).lower()
     counts = {n: text.count(n) for n in COVER_NAMES if text.count(n)}
     return max(counts, key=counts.get) if counts else None
 
@@ -1019,14 +1067,19 @@ def _tidy(point):
 def planting_window(items, crop):
     """Planting window quoted in search snippets -> (text, source item) or None.
 
+    Uses university/government/extension results when they give a date, other trusted sources otherwise.
     Prefers an explicit range ('late April to mid-May'); otherwise falls back to the months most often named
     ('around April to May'). Only sentences about planting/seeding count, and months must fit the crop's season
     (Aug-Dec for overwintering crops, Feb-Jul otherwise), so harvest dates and report dates are ignored.
     """
+    return prefer_official(items, lambda its: _window(its, crop))
+
+
+def _window(items, crop):
     fall = crop["ffd"] == 0
     in_season = (lambda m: 8 <= m <= 12) if fall else (lambda m: 2 <= m <= 7)
     votes, first, months = {}, {}, {}
-    for it in items or []:
+    for it in items:
         for sent in re.split(r"(?<=[.!?])\s+|\s?\.\.\.\s?", it.get("snippet") or ""):
             if not re.search(r"plant|seed|sow", sent, re.I):
                 continue
@@ -1083,7 +1136,7 @@ def plan_section(res, fits, last, irrigated, info):
         lines.append(f"**Year {i + 1}: plant {crop}**")
         if "plant" in got:
             w = planting_window(got["plant"].get(crop), CROP[crop])
-            lines.append(f"- When to plant: **{w[0]}** (local source: [{_md(w[1]['title'])}]({w[1]['link']}))." if w else
+            lines.append(f"- When to plant: **{w[0]}** (source: [{_md(source_name(w[1]))}]({w[1]['link']}))." if w else
                          "- When to plant: local sources didn't give a clear date; ask your extension office.")
         lines.append(f"- Fertility: {fertility_note(CROP[crop], prev)}")
         watch = [n for n in fits[crop][2] if n != "comfortable fit"]
@@ -1105,14 +1158,14 @@ def plan_section(res, fits, last, irrigated, info):
         lines.append("")
 
     where = ", ".join(x for x in (county, state) if x)
-    ext = (got.get("ext") or [None])[0]
+    ext = prefer_official(got.get("ext"), lambda its: its[0] if its else None)
     w1 = planting_window(got.get("plant", {}).get(seq[0]), CROP[seq[0]])
     steps = [
         f"Get a soil test (pH, phosphorus, potassium) before planting {seq[0].lower()}"
         + (f" ({w1[0]})" if w1 else "") + ". The advisor can't see soil nutrients.",
         f"Line up cover crop seed before the year 1 harvest so it can be sown right away.",
         f"Check the plan with your {'county ' if county else ''}extension office{' in ' + where if where else ''}"
-        + (f", starting with [{_md(ext['title'])}]({ext['link']})." if ext else "."),
+        + (f", starting with [{_md(ext['title'])}]({ext['link']}) ({_md(source_name(ext))})." if ext else "."),
         "Before committing acres, check that you have a buyer and the equipment for every crop in the cycle.",
     ]
     if not info or not got:

@@ -6,3 +6,5 @@ secrets.env
 # Local caches
 prism_cache/
 __pycache__/
+.serp_cache.json
+.serp_cache.tmp
